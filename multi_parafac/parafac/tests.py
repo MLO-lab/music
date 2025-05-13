@@ -11,6 +11,10 @@ import os
 import subprocess
 from itertools import repeat
 
+import tensorly as tl
+from tensorly.decomposition import parafac
+from tensorly.cp_tensor import cp_to_tensor
+
 
 def RMSELoss(yhat,y):
     return torch.sqrt(torch.mean((yhat-y)**2))
@@ -49,12 +53,13 @@ def create_dataset(elem):
     device = f"cuda:{gpu.get_free_gpu_idx()}"
     for i in list(range(0, elem[1])):
         #print("1")
-        data = synthetic.DataGenerator(n_drugs = elem[2],
-                                      n_features = elem[4],
-                                      n_samples = elem[3],
-                                      a = elem[6],
-                                      b = elem[7],
-                                      device = device)
+        data = synthetic.DataGenerator(n_samples = elem[2],
+                                       n_features = elem[4],
+                                       R =  elem[5],
+                                       n_drugs = elem[3],
+                                       a = elem[6],
+                                       b = elem[7],
+                                       device = device)
         #print("2")
         rng = data.generate(seed = elem[0])
         #print("3")
@@ -88,15 +93,35 @@ def create_dataset(elem):
         seed=elem[0]
     )
     end_time = time.time()
+
+    # Use pytorch as backend for tensorly
+    tl.set_backend('pytorch')
+    tensor = [x.Y for x in data_list]
+    weight, factors = parafac(tensor[0], rank=elem[5], init='random')
+    
+    # Get the decomposed factors
+    factor_1, factor_2, factor_3 = factors
+    
+    # Reconstruct the original tensor
+    reconstructed_tensor = cp_to_tensor((weight, factors))
+    
+    # The inferred tensor is not taken from the posterior, but multiplied from the inferred factor matrices
+    inferred_tensor = torch.einsum('ir,jr,kr->ijk', factor_1, factor_2, factor_3)
+    #inferred_tensor_with_noise = pyro.sample("Y", dist.Normal(torch.einsum('ir,jr,kr->ijk', factor_1, factor_2, factor_3), 1/tau))
+    
+    RMSE_Tensorly = RMSELoss(inferred_tensor, tensor[0])
+    print("RMSE_Tensorly")
+    print(RMSE_Tensorly)
+    
+    
     samples = model._guide.median()
     samples['Y'] = torch.einsum('ir,jr,kr->ijk', samples['A1'], samples['A2'], samples['A3'])
     cat_tensor = torch.cat([x['Y_sim'] for x in sim_list], 2)
     new_dict = dict({'Y_sim' : cat_tensor, 'A1_sim' : sim_list[0]['A1_sim'], 'A2_sim' : sim_list[0]['A2_sim'], 'A3_sim' : sim_list[0]['A3_sim']}, **{k: samples[k] for k in ('Y')})
     #TODO: RMSE with NA values
-    print(" Y devices")
-    print(new_dict['Y'].device)
-    print(new_dict['Y_sim'].device)
-    data_tuple = (*elem, float(RMSELoss(new_dict['Y'], torch.nan_to_num(new_dict['Y_sim']))), end_time - start_time)
+    data_tuple = (*elem, float(RMSELoss(new_dict['Y'], torch.nan_to_num(new_dict['Y_sim']))), float(RMSE_Tensorly.item()), end_time - start_time)
+    print("datatuple")
+    print(len(data_tuple))
     return data_tuple
 
 def parallel_create_dataset(procs, **kwargs):
@@ -108,18 +133,19 @@ def parallel_create_dataset(procs, **kwargs):
     
     data_df = pd.DataFrame([results[i][0] for i in range(0, len(results))])
     data_df.columns = ['seed', 'n_views', 'n_drugs', 'n_samples', 'n_features', 
-                       'R', 'a', 'b', 'c', 'd', 'percentNA', 'RMSE', 'time']
+                       'R', 'a', 'b', 'c', 'd', 'percentNA', 'Model', 'Tensorly', 'time']
         
     return(data_df)
 
 # Function to create a random tensor and compute its mean
 def task_worker(elem, filepath):
     result = create_dataset(elem)
-    print(result)
+    print("df")
+    print(len(result))
     df = pd.DataFrame([result])
-    print(df)
+    print(df.shape)
     df.columns = ['seed', 'n_views', 'n_drugs', 'n_samples', 'n_features',
-                          'R', 'a', 'b', 'c', 'd', 'percentNA', 'RMSE', 'time']
+                  'R', 'a', 'b', 'c', 'd', 'percentNA', 'Model',  'Tensorly', 'time']
     df.to_csv(filepath)
 
 # Function for accuracy and silhouette
@@ -141,39 +167,41 @@ def task_worker_accuracy(filepath, dataTensor_filepath, one_hot_encoding_filepat
                                            random_state = 42,
                                            n_epochs=n_epochs,
                                            n_particles=1,
-                                           learning_rate=0.001,
+                                           learning_rate=0.01,
                                            optimizer="clipped",
                                            verbose=1,
                                            seed=42)
-    df = pd.DataFrame(result, columns=['seed', 'fold', 'scale', 'accuracy', 'silhouette'])
+    df = pd.DataFrame(result, columns=['seed', 'fold', 'scale', 'train_accuracy', 'val_accuracy', 'silhouette'])
     df.to_csv(filepath)
 
 # Function for accuracy and silhouette
-def task_worker_accuracy_CV(filepath, dataTensor_filepath, one_hot_encoding_filepath, n_features, n_epochs, scale_factor, compute_silhouette=True):
+def task_worker_accuracy_CV(filepath, dataTensor_filepath, one_hot_encoding_filepath, n_features, n_epochs, scale_factor, parallel=True, compute_silhouette=True):
     dataTensor = torch.load(dataTensor_filepath)
     one_hot_encoding = torch.load(one_hot_encoding_filepath)
-    tcga_metadata = pd.read_csv("/home/kdeazevedo/TCGA_metadata.tsv", sep = "\t", index_col = 1)
-    metadata_array = tcga_metadata.primary_diagnosis
+    tcga_metadata = pd.read_csv("/home/kdeazevedo/Codes/github/TCGA_skin_prostate__metadata.tsv", sep = "\t", index_col = 1)
+    print(tcga_metadata)
+    metadata_array = tcga_metadata.project_id
     result = training.Kfold_cross_validation(dataTensor, 
                                              one_hot_encoding,
                                              [n_features],
                                              metadata_array = metadata_array,
-                                             metadata = "primary_diagnosis",
+                                             metadata = "project_id",
                                              R = 30,
                                              use_gpu = True,
                                              scale_factor = scale_factor,
+                                             parallel = parallel,
                                              random_state = 42,
                                              num_folds = 15,
                                              shuffle = True,
                                              n_epochs=n_epochs,
                                              n_particles=1,
-                                             learning_rate=0.001,
+                                             learning_rate=0.1,
                                              optimizer="clipped",
-                                             compute_silhouette=compute_silhouette,
                                              verbose=1,
-                                             seed=42)
+                                             seed=42,
+                                             compute_silhouette=compute_silhouette)
     #print(result)
-    df = pd.DataFrame(result, columns=['seed', 'fold', 'scale', 'accuracy', 'silhouette'])
+    df = pd.DataFrame(result, columns=['seed', 'fold', 'scale', 'train_accuracy', 'val_accuracy', 'silhouette'])
     df.to_csv(filepath)
 
 # Function to submit a Slurm job for a specific task
@@ -222,7 +250,7 @@ def parallel_create_dataset_2(procs, **kwargs):
     all_args = create_element(**kwargs)
 
     data_df = pd.DataFrame(columns=['seed', 'n_views', 'n_drugs', 'n_samples', 'n_features', 
-                                    'R', 'a', 'b', 'c', 'd', 'percentNA', 'RMSE', 'time'])
+                                    'R', 'a', 'b', 'c', 'd', 'percentNA', 'Model',  'Tensorly', 'time'])
     data_df.to_csv("test.csv")
 
     print(zip(range(len(all_args)), all_args, repeat(data_df)))
@@ -282,6 +310,6 @@ def parallel_create_dataset_3(procs, **kwargs):
     print(job_info)
     data_df = pd.DataFrame([job_info[i] for i in range(0, len(job_info))])
     data_df.columns = ['seed', 'n_views', 'n_drugs', 'n_samples', 'n_features', 
-                       'R', 'a', 'b', 'c', 'd', 'percentNA', 'RMSE', 'time']
+                       'R', 'a', 'b', 'c', 'd', 'percentNA', 'Model', 'Tensorly', 'time']
         
     return(data_df)

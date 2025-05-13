@@ -69,8 +69,8 @@ class DataGenerator:
         # We create three sparse matrices that serve as our factor matrices
         cov = torch.diag(torch.tensor([self.a]*self.R)/torch.tensor([self.b]*self.R))
         zeros = torch.zeros([self.R])
-        A1 = torch.Tensor(rng.multivariate_normal(zeros, cov, size = self.n_drugs))
-        A2 = torch.Tensor(rng.multivariate_normal(zeros, cov, size = self.n_samples))
+        A1 = torch.Tensor(rng.multivariate_normal(zeros, cov, size = self.n_samples))
+        A2 = torch.Tensor(rng.multivariate_normal(zeros, cov, size = self.n_drugs))
         A3 = torch.Tensor(rng.multivariate_normal(zeros, cov, size = self.n_features))
                 
         # We create the tensor from these matrices, and add noise. The noisy tensor is the one we want to learn.

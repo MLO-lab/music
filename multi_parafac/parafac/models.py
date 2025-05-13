@@ -17,6 +17,7 @@ import pyro.contrib.gp as gp
 from pyro.optim import Adam, ClippedAdam
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class PARAFAC(PyroModule):
         observations,
         n_features,
         outcome_obs = None,
-        p = None,
+        p = 1,
         metadata = None,
         index = None,
         n_samples = 100,
@@ -70,24 +71,23 @@ class PARAFAC(PyroModule):
         """
         super().__init__(name="PARAFAC")
 
+        self.device = device
+        torch.set_default_device(self.device)
+
         self.covariates = covariates
         self.view_names = view_names
         self.observations = observations
         self.metadata = metadata
         self.index = index
         self.n_samples = n_samples
-        print("device arg")
-        print(device)
-        self.device = device
         if(device == None):
             self.device = torch.device("cpu")
             if use_gpu and torch.cuda.is_available():
                 logger.info("GPU available, running all computations on the GPU.")
                 self.device = f"cuda:{get_free_gpu_idx()}"
                 #self.device="cuda:0"
-        print("self.device")
-        print(self.device)
-        self.to(self.device)
+        #self.to(self.device)
+        
 
         self._model = None
         self._guide = None
@@ -131,13 +131,86 @@ class PARAFAC(PyroModule):
                     list_tensor.append(X)
                 self.tensor_data = torch.cat(list_tensor, 2)
 
-        print(self.tensor_data.shape)
         self.tensor_data = self.tensor_data.to(self.device)
                 
         return self.tensor_data  
+
+    def _custom_guide(self,
+                    obs: torch.Tensor = None,
+                    obs_outcome: torch.Tensor = None,
+                    mask: torch.Tensor = None,
+                    A2 = None,
+                    A3 = None,
+                    scale_factor = 1.1,):
+        # Plates to match the model's structure
+        rank_plate = self._model.get_plate("rank")
+        view_plate = self._model.get_plate("view")
+        factor1_plate = self._model.get_plate("factor1")
+        factor2_plate = self._model.get_plate("factor2")
+        factor3_plate = self._model.get_plate("factor3")
+    
+        tau_loc = pyro.param("tau_loc", torch.tensor(1.0, device=self.device))
+        tau_scale = pyro.param("tau_scale", torch.tensor(0.1, device=self.device), constraint=constraints.positive)
+        pyro.sample("tau", dist.Normal(tau_loc, tau_scale))
+    
+        with view_plate:
+            view_shrinkage_loc = pyro.param("view_shrinkage_loc", torch.ones(1, device=self.device))
+            view_shrinkage_scale = pyro.param("view_shrinkage_scale", torch.ones(1, device=self.device), constraint=constraints.positive)
+            pyro.sample("view_shrinkage", dist.Normal(view_shrinkage_loc, view_shrinkage_scale))
+    
+        with rank_plate:
+            with view_plate:
+                rank_scale_loc = pyro.param("rank_scale_loc", torch.ones(1, device=self.device))
+                rank_scale_scale = pyro.param("rank_scale_scale", torch.ones(1, device=self.device), constraint=constraints.positive)
+                pyro.sample("rank_scale", dist.Normal(rank_scale_loc, rank_scale_scale))
+        
+            lmbda_loc = pyro.param("lmbda_loc", torch.ones(self.R, device=self.device))
+            lmbda_scale = pyro.param("lmbda_scale", torch.ones(self.R, device=self.device), constraint=constraints.positive)
+            pyro.sample("lmbda", dist.Normal(lmbda_loc, lmbda_scale))
+    
+            with factor1_plate:
+                A1_loc = pyro.param("A1_loc", torch.randn(self.tensor_data.shape[0], self.R, device=self.device))
+                A1_scale = pyro.param("A1_scale", torch.ones(self.tensor_data.shape[0], self.R, device=self.device), constraint=constraints.positive)
+                pyro.sample("A1", dist.Normal(A1_loc, A1_scale))
+        
+            with factor2_plate:
+                A2_loc = pyro.param("A2_loc", torch.randn(self.tensor_data.shape[1], self.R, device=self.device))
+                A2_scale = pyro.param("A2_scale", torch.ones(self.tensor_data.shape[1], self.R, device=self.device), constraint=constraints.positive)
+                pyro.sample("A2", dist.Normal(A2_loc, A2_scale))
+        
+            with factor3_plate:
+                A3_loc = pyro.param("A3_loc", torch.randn(self.tensor_data.shape[2], self.R, device=self.device))
+                A3_scale = pyro.param("A3_scale", torch.ones(self.tensor_data.shape[2], self.R, device=self.device), constraint=constraints.positive)
+                A3 = pyro.sample("A3", dist.Normal(A3_loc, A3_scale))
+
+        with factor2_plate:
+            beta_m_loc = pyro.param("beta_m_loc", torch.zeros(1, 1, device=self.device))
+            beta_m_scale = pyro.param("beta_m_scale", torch.ones(1, 1, device=self.device), constraint=constraints.positive)
+            beta_m = pyro.sample("beta_m", dist.Normal(beta_m_loc, beta_m_scale))
+
+        
+        regression_model = RegressionModel2(self.device, A3, beta_m, self.outcome_obs.shape[1]).to(self.device)
+        probs = regression_model(self.tensor_data)
+        y_dist = dist.OneHotCategorical(probs=probs)
+        with factor1_plate:
+            with pyro.poutine.scale(scale=self.scale_factor):
+                pyro.sample("outcome", y_dist, infer={"enumerate": "parallel"})
+
+        classification_loss = y_dist.log_prob(self.outcome_obs)
+        # Note that the negative sign appears because we're adding this term in the guide
+        # and the guide log_prob appears in the ELBO as -log q]
+        #TODO: self.alpha
+        pyro.factor("classification_loss", -0.01 * classification_loss, has_rsample=False)
+
         
     
-    def _setup_model_guide(self, batch_size: int):
+    def _setup_model_guide(self, 
+                           obs: torch.Tensor = None,
+                            obs_outcome: torch.Tensor = None,
+                            mask: torch.Tensor = None,
+                            A2 = None,
+                            A3 = None,
+                            scale_factor = 1.1,):
         """Setup model and guide.
 
         Parameters
@@ -164,6 +237,17 @@ class PARAFAC(PyroModule):
                 device=self.device,
             )
 
+            self.tensor_data = self.tensor_data
+
+            def generate_values():
+                values = {'tau' : torch.tensor([1]).to(self.device),
+                    'lmbda' : torch.tensor([1]*self.R).to(self.device)/torch.tensor([1]*self.R).to(self.device),
+                    'A1': torch.distributions.MultivariateNormal(torch.zeros(self.tensor_data.shape[0], self.R).to(self.device), torch.eye(self.R).to(self.device)).sample(),
+                    'A2': torch.distributions.MultivariateNormal(torch.zeros(self.tensor_data.shape[1], self.R).to(self.device), torch.eye(self.R).to(self.device)).sample(),
+                    'A3': torch.distributions.MultivariateNormal(torch.zeros(self.tensor_data.shape[2], self.R).to(self.device), torch.eye(self.R).to(self.device)).sample(),
+                    'Y': self.tensor_data.to(self.device)}
+                return pyro.infer.autoguide.initialization.init_to_value(values=values)
+
             '''
             init_values={'tau' : torch.tensor([1]).to(self.device),
                     'lmbda' : torch.tensor([1]*self.R).to(self.device)/torch.tensor([1]*self.R).to(self.device),
@@ -173,9 +257,20 @@ class PARAFAC(PyroModule):
                     'Y': self.tensor_data.to(self.device)}
             '''
             
-            self._guide = AutoNormal(self._model.to(self.device),
-                                     #init_loc_fn=pyro.infer.autoguide.initialization.init_to_value(values=init_values), 
+            
+            self._guide = AutoNormal(self._model,
+                                     #init_loc_fn=pyro.infer.autoguide.initialization.init_to_generated(generate=generate_values), 
                                      init_scale=0.01)
+            #print("self._model.device")
+            #print(self._model.device)
+
+            #self._guide = self._custom_guide(obs,
+            #                                obs_outcome,
+            #                                mask,
+            #                                A2,
+            #                                A3,
+            #                                scale_factor)
+            print(self._guide)
             
             self._built = True
         return self._built
@@ -202,6 +297,7 @@ class PARAFAC(PyroModule):
             pyro or torch optimizer object
         """
 
+        print("optimizer")
         optim = Adam({"lr": learning_rate, "betas": (0.95, 0.999)})
         if optimizer.lower() == "clipped":
             n_iterations = int(n_epochs * (self.n_samples // batch_size))
@@ -239,11 +335,12 @@ class PARAFAC(PyroModule):
         if scale:
             scaler = 1.0 / self.n_samples
 
+        #guide = config_enumerate(self._guide, "parallel", expand=True)
         svi = pyro.infer.SVI(
-            model=pyro.poutine.scale(self._model, scale=scaler),
-            guide=pyro.poutine.scale(self._guide, scale=scaler),
+            model=self._model,
+            guide=self._guide,
             optim=optimizer,
-            loss=pyro.infer.TraceEnum_ELBO(
+            loss=pyro.infer.Trace_ELBO(
                 retain_graph=True,
                 num_particles=n_particles,
                 vectorize_particles=True,
@@ -262,8 +359,12 @@ class PARAFAC(PyroModule):
         tuple
             Tuple of (obs, mask, covs, prior_scales)
         """
-        train_obs = self.tensor_data.to(self.device)
+        print("train_obs")
+        train_obs = self.tensor_data
+        train_obs = torch.nan_to_num(train_obs)
+        print("mask")
         mask_obs = ~torch.isnan(train_obs)
+        print("mask done")
         #TODO: Find a better way to do this
         if self.outcome_obs is not None:
             outcome_obs = self.outcome_obs.to(self.device) 
@@ -271,9 +372,40 @@ class PARAFAC(PyroModule):
             outcome_obs = self.outcome_obs
         # replace all nans with zeros
         # self.presence mask takes care of gradient updates
-        train_obs = torch.nan_to_num(train_obs)
-        train_obs = train_obs.to(self.device)
-        mask_obs = mask_obs.to(self.device)
+
+        '''
+        # Assume train_obs has the shape (D1, D2, D3)
+        chunk_size = 1000  # Adjust based on available memory
+        
+        # Create an empty list to hold processed chunks
+        processed_chunks = []
+
+        torch.cuda.empty_cache() 
+        # Iterate over the first dimension in chunks
+        for i in range(0, train_obs.shape[0], chunk_size):
+            print(i)
+            #print(i)
+            chunk = train_obs[i:i + chunk_size]  # Extract a chunk
+            #print("chunk")
+            with torch.no_grad(): 
+                processed_chunk = torch.nan_to_num(chunk.to(self.device))  # Process the chunk
+            #print("chunk nan to num")
+            processed_chunks.append(processed_chunk)  # Append the processed chunk
+            #print("append")
+
+            # Release the chunk to free up memory
+            del chunk, processed_chunk
+            gc.collect()
+            torch.cuda.empty_cache() 
+            torch.cuda.synchronize()  # Ensure all ops are done
+            print(f"GPU memory after chunk {i}: {torch.cuda.memory_allocated()} bytes")
+        
+        # Concatenate the processed chunks back into a single tensor
+        train_obs = torch.cat(processed_chunks, dim=0)
+        '''
+
+        train_obs = train_obs
+        mask_obs = mask_obs
 
         #train_covs = None
         #if self.covariates is not None:
@@ -333,6 +465,8 @@ class PARAFAC(PyroModule):
         else:
             self.tensor_data = self.observations
 
+        (train_obs, outcome_obs, mask_obs) = self._setup_training_data()
+
         # if invalid or out of bounds set to n_samples 
         if batch_size is None or not (0 < batch_size <= self.n_samples):
             batch_size = self.n_samples
@@ -341,7 +475,12 @@ class PARAFAC(PyroModule):
             n_particles = max(1, 1000 // batch_size)
         logger.info("Using %s particles on parallel", n_particles)
         logger.info("Preparing model and guide...")
-        self._setup_model_guide(batch_size)
+        self._setup_model_guide(train_obs, 
+                                outcome_obs, 
+                                mask_obs,
+                                self.A2, 
+                                self.A3, 
+                                self.scale_factor)
         logger.info("Preparing optimizer...")
         optimizer = self._setup_optimizer(
             batch_size, n_epochs, learning_rate, optimizer
@@ -356,13 +495,13 @@ class PARAFAC(PyroModule):
             #train_prior_scales,
         #) = self._setup_training_data()
         
-        (train_obs, outcome_obs, mask_obs) = self._setup_training_data()
+        
         
         #train_prior_scales = train_prior_scales.to(self.device)
-
         if batch_size < self.n_samples:
             logger.info("Using batches of size %s.", batch_size)
-            tensors = (train_obs, outcome_obs, mask_obs)
+            #outcome obs can't be None, must be empty tensor TODO
+            tensors = (train_obs, mask_obs)
             if self.covariates is not None:
                 tensors += (train_covs,)
             data_loader = DataLoader(
@@ -377,6 +516,8 @@ class PARAFAC(PyroModule):
             def _step():
                 iteration_loss = 0
                 for _, (sample_idx, tensors) in enumerate(data_loader):
+                    #print(sample_idx.shape)
+                    #print(x.shape for x in tensors)
                     iteration_loss += svi.step(
                         sample_idx.to(self.device),
                         *[tensor.to(self.device) for tensor in tensors],
@@ -389,17 +530,18 @@ class PARAFAC(PyroModule):
             train_obs = train_obs
             mask_obs = mask_obs
             outcome_obs = outcome_obs
-            #print(train_obs.shape)
-            #print(mask_obs.shape)
-            #print(outcome_obs.shape)
-
             #if train_covs is not None:
             #    train_covs = train_covs.to(self.device)
 
             def _step():
                 return svi.step(
-                    train_obs, outcome_obs, mask_obs, self.p,
-                    self.A2, self.A3, self.scale_factor
+                    #self
+                    train_obs.to(self.device), 
+                    outcome_obs, 
+                    mask_obs.to(self.device),
+                    self.A2, 
+                    self.A3, 
+                    self.scale_factor
                 )
 
         self.seed = seed
@@ -454,7 +596,6 @@ class GPModel(PyroModule):
         )        
 
     def train(self):
-        print("Train GP")
         loss = gp.util.train(self.gp_layer, num_steps=1000)
         return loss
 
@@ -467,7 +608,7 @@ class GPModel(PyroModule):
     
         return mean, var
 
-class RegressionModel(torch.nn.Module):
+class RegressionModel2(torch.nn.Module):
     def __init__(self, p, device, weight):
         # p = number of features
         self.device = device
@@ -481,20 +622,34 @@ class RegressionModel(torch.nn.Module):
         out = self.linear(x)
         return self.non_linear(out)
 
-class RegressionModel2(torch.nn.Module):
-    def __init__(self, p, R, device):
-        super(RegressionModel, self).__init__()
+class RegressionModel(torch.nn.Module):
+    def __init__(self, device, W, beta_m, num_class):
+        # p = number of features
         self.device = device
-        
-        # Define logistic regression parameters
-        self.beta = torch.nn.Parameter(torch.zeros(p, R).to(self.device))
-        print("beta shape")
-        print(self.beta.shape)
-        
-    def forward(self, x, W):
-        # Compute activation
-        out = self.linear(x * self.beta.T * W.T)
-        return torch.exp(out)  # Apply exponential transformation
+        self.W = W.to(self.device)
+        self.beta_m = beta_m.to(self.device)
+        self.out = None
+        self.out3 = None
+        self.out2 = None
+        super(RegressionModel, self).__init__()
+        self = self.to(self.device)
+        self.non_linear = torch.nn.Softmax(dim=1).to(self.device)
+        self.linear = torch.nn.Linear(W.shape[1], num_class, bias=True)
+        #loc, scale = torch.zeros(p, R), 10 * torch.ones(p, R)
+
+    def forward(self, x):
+        #out = torch.matmul(self.W, x)
+        out = torch.einsum('rp,nmp->rmn', [self.W.T.double(), x.double()]).to(self.device)
+        #out2 = torch.matmul(self.beta_m, out)
+        torch.cuda.empty_cache()
+        out2 = torch.einsum('mo,rmn->rno', [self.beta_m.double(), out]).to(self.device)
+        out2 = torch.squeeze(out2, 2).T
+        self.out2 = out2
+        self.out = out
+        out3 = self.linear(out2.float()).to(self.device)
+        self.out3 = out3
+        res =  self.non_linear(out3).to(self.device)
+        return res
 
 def make_fc(dims):
     layers = []
@@ -522,7 +677,7 @@ class PARAFACModel(PyroModule):
         tensor_data, 
         n_features,
         metadata,
-        p = None,
+        p = 1,
         R: int = 10, 
         a: int = 1, 
         b: int = 0.5, 
@@ -530,7 +685,7 @@ class PARAFACModel(PyroModule):
         d: int = 0.5,
         device: bool = None
     ):
-        """MuVI generative model.
+        """PARAFAC generative model.
 
         Parameters
         ----------
@@ -554,14 +709,20 @@ class PARAFACModel(PyroModule):
         self.n_features = n_features
         self.feature_offsets = [0] + np.cumsum(self.n_features).tolist()
         self.n_views = len(self.n_features)
+        self.RegressionModel = None
         self.R = R
         self.a = a
         self.b = b
         self.c = c
         self.d = d
         self.p = p
+        self.Ws = []
+        self.beta_ms = []
+        self.A3s = []
+        self.output_dict = {}
     
         self.device = device
+        self.to(self.device)
 
     def get_plate(self, name: str, **kwargs):
         """Get the sampling plate.
@@ -577,11 +738,11 @@ class PARAFACModel(PyroModule):
             A pyro plate.
         """
         plate_kwargs = {
-            "rank": {"name": "rank", "size": self.R, "dim": -1},
+            "rank": {"name": "R", "size": self.R, "dim": -1},
             "view": {"name": "view", "size": self.n_views, "dim": -2},
-            "factor1": {"name": "sample", "size": self.tensor_size[0]},
-            "factor2": {"name": "factor", "size": self.tensor_size[1]},
-            "factor3": {"name": "feature", "size": self.tensor_size[2]},
+            "factor1": {"name": "samples", "size": self.tensor_size[0]},
+            "factor2": {"name": "slices", "size": self.tensor_size[1]},
+            "factor3": {"name": "features", "size": self.tensor_size[2]},
             "class": {"name": "class", "size": self.p}
         }
         #print("self tensor size")
@@ -594,7 +755,6 @@ class PARAFACModel(PyroModule):
         obs: torch.Tensor = None,
         obs_outcome: torch.Tensor = None,
         mask: torch.Tensor = None,
-        p = None,
         A2 = None,
         A3 = None,
         scale_factor = 1.1,
@@ -616,7 +776,8 @@ class PARAFACModel(PyroModule):
             Samples from each sampling site
         """
 
-        output_dict = {}
+        #print(obs.shape)
+        
         
         rank_plate = self.get_plate("rank")
         view_plate = self.get_plate("view")
@@ -625,8 +786,8 @@ class PARAFACModel(PyroModule):
         factor3_plate = self.get_plate("factor3")
         class_plate = self.get_plate("class")
 
-        tau = pyro.sample("tau", dist.Gamma(self.a, self.b))
-        output_dict["tau"] = tau.to(self.device)
+        tau = pyro.sample("tau", dist.InverseGamma(self.a, self.b))
+        self.output_dict["tau"] = tau.to(self.device)
 
         
         # Check memory usage
@@ -639,39 +800,40 @@ class PARAFACModel(PyroModule):
         
         with view_plate:
             view_shrinkage = pyro.sample("view_shrinkage", dist.HalfCauchy(torch.ones(1, device=self.device)))
-            output_dict["view_shrinkage"] = view_shrinkage.to(self.device)
+            self.output_dict["view_shrinkage"] = view_shrinkage.to(self.device)
         
         with rank_plate:
             with view_plate:
                 rank_scale = pyro.sample("rank_scale", dist.HalfCauchy(torch.ones(1, device=self.device)))
-                output_dict["rank_scale"] = rank_scale.to(self.device)
-            lmbda = pyro.sample("lmbda", dist.Gamma(self.c, self.d))
-            output_dict["lmbda"] = lmbda.to(self.device)
+                self.output_dict["rank_scale"] = rank_scale.to(self.device)
+            lmbda = pyro.sample("lmbda", dist.InverseGamma(self.c, self.d))
+            #lmbda_old = pyro.sample("lmbda_old", dist.Gamma(self.c, self.d))
+            self.output_dict["lmbda"] = lmbda.to(self.device)
             #beta = pyro.sample("beta", dist.Normal(torch.zeros(1), torch.ones(1)))
            
             with factor1_plate:
-                a = pyro.sample("A1", dist.Normal(torch.zeros(self.R, device=self.device), output_dict["lmbda"]))
-                output_dict["A1"] = a.to(self.device)
+                a = pyro.sample("A1", dist.Normal(torch.zeros(self.R, device=self.device), torch.ones(1, device=self.device)))
+                self.output_dict["A1"] = a.to(self.device)
 
             with factor2_plate:
                 if(A2 != None):
-                    output_dict["A2"] = pyro.deterministic("A2", A2).to(self.device)
+                    self.output_dict["A2"] = pyro.deterministic("A2", A2).to(self.device)
                 else:
-                    output_dict["A2"] = pyro.sample("A2", dist.Normal(torch.zeros(self.R, device=self.device), output_dict["lmbda"])).to(self.device)
+                    self.output_dict["A2"] = pyro.sample("A2", dist.Normal(torch.zeros(self.R, device=self.device), torch.ones(1, device=self.device))).to(self.device)
                 
             with factor3_plate:
                 if(A3 != None):
-                    output_dict["A3"] = pyro.deterministic("A3", A3).to(self.device)
+                    self.output_dict["A3"] = pyro.deterministic("A3", A3).to(self.device)
                 else:
                     local_scale = pyro.sample("local_scale", dist.HalfCauchy(torch.ones(1, device =  self.device)))
-                    output_dict["local_scale"] = local_scale.to(self.device)
+                    self.output_dict["local_scale"] = local_scale.to(self.device)
                     var = torch.cat(
                         [
                             (
-                                output_dict["lmbda"] / 
-                                (output_dict["view_shrinkage"][i] 
-                                 * output_dict["rank_scale"][i] 
-                                 * output_dict["local_scale"][
+                                self.output_dict["lmbda"] / 
+                                (self.output_dict["view_shrinkage"][i] 
+                                 * self.output_dict["rank_scale"][i] 
+                                 * self.output_dict["local_scale"][
                                     self.feature_offsets[i] : self.feature_offsets[i + 1]
                                  ])
                             )
@@ -680,12 +842,13 @@ class PARAFACModel(PyroModule):
                         0,
                     )    
                     #print(var.shape)
-                    output_dict["A3"] = pyro.sample("A3", dist.Normal(torch.zeros(self.R, device=self.device), var)).to(self.device)
+                    self.output_dict["A3"] = pyro.sample("A3", dist.Normal(torch.zeros(self.R, device=self.device), var)).to(self.device)
 
 
+        
         #TODO:Class Attribute!!
         p = self.p
-        
+        '''
         with rank_plate:
             with class_plate:
                 #self.R
@@ -697,31 +860,72 @@ class PARAFACModel(PyroModule):
             with pyro.poutine.scale(scale=scale_factor):
                 # Create unit normal priors over the parameters
                 regression_model = RegressionModel(p, self.device, weight)
-                probs = regression_model(output_dict["A1"])
-                output_dict["outcome"] = pyro.sample("outcome",
+                probs = regression_model(self.output_dict["A1"])
+                self.output_dict["outcome"] = pyro.sample("outcome",
                                                      dist.OneHotCategorical(probs=probs).to_event(1),
                                                      obs=obs_outcome)
+                                                     
+        '''
+
+        
+        '''
+        with factor2_plate:
+            loc, scale = torch.zeros(1, 1, device=self.device), 10 * torch.ones(1, 1, device=self.device)
+            self.output_dict["beta_m"] =  pyro.sample("beta_m", dist.Normal(loc, scale)).to(self.device)
+
+        
+        with factor1_plate:
+            with pyro.poutine.scale(scale=scale_factor):
+                # Create unit normal priors over the parameters
+                # Maynbe ok with p ?
+                regression_model = RegressionModel(self.device, self.output_dict["A3"], self.output_dict["beta_m"], p).to(self.device)
+                #regression_model = RegressionModel(self.device, self.output_dict["A3"], self.output_dict["beta_m"], obs_outcome.shape[1]).to(self.device)
+                self.RegressionModel = regression_model.to(self.device)
+                probs = regression_model(obs)
+                y_dist = dist.OneHotCategorical(probs=probs)
+                self.output_dict["outcome"] = pyro.sample("outcome",
+                                                     y_dist.to_event(1),
+                                                     infer={"enumerate": "parallel"},
+                                                     obs=obs_outcome).to(self.device)
+                self.Ws.append(torch.var_mean(self.RegressionModel.W))
+                self.beta_ms.append(self.RegressionModel.beta_m)
+                self.A3s.append(self.output_dict["A3"])
+
+        
+                classification_loss = y_dist.to_event(1).log_prob(obs_outcome)
+                classification_loss = classification_loss.to(self.device)
+                # Note that the negative sign appears because we're adding this term in the guide
+                # and the guide log_prob appears in the ELBO as -log q]
+                #TODO: self.alpha
+                pyro.factor("classification_loss", -10 * classification_loss, has_rsample=False)
+        '''
+
+    
         
         if(mask is None):
-            output_dict["Y"] = pyro.sample(
+            print("No mask")
+            self.output_dict["Y"] = pyro.sample(
                 "Y",
                 dist.Normal(
-                    torch.einsum("ir,jr,kr->ijk", output_dict["A1"], output_dict["A2"], output_dict["A3"]),
-                    1 / torch.sqrt(output_dict["tau"]),
+                    torch.einsum("ir,jr,kr->ijk", self.output_dict["A1"], self.output_dict["A2"], self.output_dict["A3"]),
+                    1 / torch.sqrt(self.output_dict["tau"]),
                 ).to_event(3),
                 obs=obs,
                 infer={"is_auxiliary": True},
             ).to(self.device)
         else:
-            with pyro.poutine.scale(scale=(1/scale_factor)):
-                output_dict["Y"] = pyro.sample(
-                    "Y",
-                    dist.Normal(
-                        torch.einsum("ir,jr,kr->ijk", output_dict["A1"], output_dict["A2"], output_dict["A3"]),
-                        1 / torch.sqrt(output_dict["tau"]),
-                    ).mask(mask).to_event(3),
-                    obs=obs,
-                    infer={"is_auxiliary": True},
-                ).to(self.device)
+            mask = mask.int()
+            #with pyro.poutine.scale(scale=(1/scale_factor)):
+            self.output_dict["Y"] = pyro.sample(
+                "Y",
+                dist.Normal(
+                    torch.einsum("ir,jr,kr->ijk", self.output_dict["A1"], self.output_dict["A2"], self.output_dict["A3"]),
+                    1 / torch.sqrt(self.output_dict["tau"]),
+                ).mask(mask).to_event(3),
+                obs=obs,
+                infer={"is_auxiliary": True},
+            ).to(self.device)
+
+        self = self.to(self.device)
                 
-        return output_dict
+        return self.output_dict
