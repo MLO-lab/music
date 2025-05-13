@@ -1,6 +1,6 @@
 # bayesian-parafac
 
-To run the Synthetic data notebook, first install the conda environment and activate it :
+To run the either the Synthetic data notebook or pseudo-bulk tutorial, first install the conda environment and activate it :
 
 `conda env create -f parafac.yml
 conda activate parafac`
